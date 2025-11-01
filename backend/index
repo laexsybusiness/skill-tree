@@ -1,0 +1,119 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { pool, init } = require('./db');
+const path = require('path');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../frontend/build')));
+
+init().catch(console.error);
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+// NODES
+app.get('/api/nodes', async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM nodes');
+  res.json(rows);
+});
+
+app.post('/api/nodes', async (req, res) => {
+  const { name, domain, level, description, estimated_hours } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO nodes(name,domain,level,description,estimated_hours)
+     VALUES($1,$2,$3,$4,$5) RETURNING *`,
+    [name, domain, level, description, estimated_hours]
+  );
+  res.json(rows[0]);
+});
+
+// EDGES
+app.get('/api/edges', async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT e.*, n1.name AS from_name, n2.name AS to_name
+    FROM edges e
+    JOIN nodes n1 ON e.from_id=n1.id
+    JOIN nodes n2 ON e.to_id=n2.id
+  `);
+  res.json(rows);
+});
+
+app.post('/api/edges', async (req, res) => {
+  const { from_id, to_id } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO edges(from_id,to_id) VALUES($1,$2) RETURNING *`,
+    [from_id, to_id]
+  );
+  res.json(rows[0]);
+});
+
+// GEMINI LESSON
+app.post('/api/lesson', async (req, res) => {
+  const { node_id, user_id, age } = req.body;
+  const isChild = age && age <= 12;
+
+  const nodeRes = await pool.query('SELECT * FROM nodes WHERE id=$1', [node_id]);
+  const node = nodeRes.rows[0];
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+
+  const prereqRes = await pool.query(`
+    SELECT n.* FROM nodes n
+    JOIN edges e ON e.from_id=n.id
+    WHERE e.to_id=$1
+  `, [node_id]);
+  const prereqs = prereqRes.rows;
+
+  if (!isChild && user_id) {
+    const missing = [];
+    for (const p of prereqs) {
+      const prog = await pool.query(
+        'SELECT mastered FROM user_progress WHERE user_id=$1 AND node_id=$2',
+        [user_id, p.id]
+      );
+      if (!prog.rows[0]?.mastered) missing.push(p.name);
+    }
+    if (missing.length) {
+      return res.json({
+        blocked: true,
+        missing,
+        message: `Complete these first: ${missing.join(', ')}`
+      });
+    }
+  }
+
+  const prompt = isChild
+    ? `Create a fun lesson for a ${age}-year-old about "${node.name}". Use simple words and a story. Under 300 words.`
+    : `Create a detailed lesson on "${node.name}" (${node.level} level). Assume learner knows: ${prereqs.map(p=>p.name).join(', ') || 'nothing'}. Include examples and exercise.`;
+
+  try {
+    const result = await model.generateContent(prompt);
+    const text = result.response.text();
+    res.json({ lesson: text, node, prereqs });
+  } catch (err) {
+    res.status(500).json({ error: 'Gemini error' });
+  }
+});
+
+// PROGRESS
+app.post('/api/progress', async (req, res) => {
+  const { user_id, node_id, mastered = true } = req.body;
+  await pool.query(
+    `INSERT INTO user_progress(user_id,node_id,mastered)
+     VALUES($1,$2,$3)
+     ON CONFLICT (user_id,node_id) DO UPDATE SET mastered=$3`,
+    [user_id, node_id, mastered]
+  );
+  res.json({ success: true });
+});
+
+// Serve frontend
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/build', 'index.html'));
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server on ${PORT}`));
